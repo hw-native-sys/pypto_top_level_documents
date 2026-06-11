@@ -1558,3 +1558,230 @@ Observations tying back to the design:
 3. **Two accumulation regimes coexist (§25).** Activation grads (`dh1, dh2, dx1, dx`) accumulate in the **transient** region via fan-in = forward fan-out; parameter grads (`*.grad`) accumulate in the **persistent** region via `atomic_add`, surviving to `opt.step`.
 4. **`flash` is the memory hotspot.** Its `saved_ctx = {q',k',v,a,lse}` dominates this block's SAVED footprint; `lse` being `[S,1]` rather than `[S,S]` (§5.3) is the single biggest activation-memory saving in the block.
 5. **Stacking blocks.** A full model is `llama_block` repeated `L` times; the tape is the concatenation of `L` such 15-entry segments, the SAVED stack grows to ≈ `L × (per-block saved)` at the fwd→bwd boundary (the dominant training-memory term, §19, §29), and `backward()` reverses all `15L` entries — with DP grad all-reduce (§35) overlapping as each block's parameter grads complete in reverse order.
+
+---
+
+# Part 5 — Eliminating Dynamic Orchestration Overhead: AOT Capture & Replay
+
+> **Scope note.** §8.7 discussed AOT of the *autograd/backward graph* (eager tape vs a `torch.compile`-style joint fwd+bwd trace). This Part addresses a **different and lower layer**: the **orchestration runtime itself** — the program that runs `submit`, derives dependencies, allocates the ring, and drives the scheduler. The question (raised for the **forward-only inference** case, then generalized): PyPTO already codegen's both orchestration and InCore into **static C++ that runs on the AICPU**, so Python is gone — yet a C++ program that *dynamically re-builds the task graph every step* still pays large per-step overhead. Can we AOT that away? The answer, grounded in mechanisms PyPTO/`simpler` already ships, is **capture-once / replay-many**, the orchestration-layer analog of CUDA Graphs.
+
+## 46. The Problem: Even in C++, the Orchestrator Is a Define-by-Run Interpreter
+
+Removing Python does **not** remove dynamic graph construction. The `simpler` runtime is a three-component engine (Orchestrator builds the DAG, Scheduler executes it, Workers run kernels). On **every** `submit_next_level` the C++ Orchestrator does, per task:
+
+| Per-submit work (eager) | Cost source in `simpler` |
+|-------------------------|---------------------------|
+| `ring.alloc()` | mutex + cv back-pressure wait, bump cursor, `std::deque<unique_ptr<TaskSlotState>>` push, per-ring FIFO bookkeeping |
+| tag walk → dependency inference | per-tensor `TensorMap.lookup`/`insert` (`unordered_map` hashing + a guarding mutex) |
+| producer set construction | a fresh `std::vector` + `unordered_set` dedup allocated per submit |
+| scope registration | `scope.register_task` vector push |
+| wiring hand-off | lock-free `wiring_queue` push → **Scheduler thread** wakeup |
+
+Then the **Scheduler thread** does, per task: Phase-0 `wire_fanout` (take each producer's `fanout_mu`, push `fanout_consumers`, set `fanin_count`); Phase-1 `dispatch_ready` (`pick_n_idle`); Phase-2 `on_task_complete` (atomic `fanin_released++` on every consumer, push newly-ready, `try_consume` → `TensorMap.erase` per output, `ring.release` FIFO advance under the ring mutex). Cross-thread, every task crosses `wiring_queue` and `completion_queue` (mutex + CV), plus a per-task mailbox `memcpy` and a spin-poll for `TASK_DONE`.
+
+The same shape recurs **on the AICPU at L2**: the `tensormap_and_ringbuffer` (PTO2) runtime derives fan-in via an on-device TensorMap and a ring buffer of `PTO2TaskDescriptor[]`, on the device scheduler's critical path (this is precisely the cost the repo already instruments with the L2 swimlane profiler and `sched_overhead_analysis.py`).
+
+**The redundancy.** For inference — and especially **decode**, where every token step submits an *identical* sub-graph with identical shapes — this entire builder pipeline re-derives the **same DAG** every step. The dependency edges, ring offsets, fan-in counts, and worker routing are invariant; only the **base addresses** of a few live-in/live-out tensors change. We are paying O(#tasks) of hashing, locking, set-allocation, and cross-thread hand-off per step to reconstruct a graph we already know. This is the orchestration overhead AOT should remove.
+
+## 47. Can We "AOT-Compile Away" the C++ Orchestration? — Reframing the Question
+
+The orchestration function has **completely free control flow** (Turing-complete: data-dependent branches, variable-length loops, dynamic shapes). Statically compiling arbitrary control flow into a single fixed schedule is, in general, **undecidable** — and even where decidable, it would require tracing all branches (the `torch.compile` graph-break / `cond` / `while_loop` story from §8.7.3). So **"pure AOT of the whole orchestration program" is the wrong target.**
+
+#### 47.1 A concrete case: DeepSeek-style MoE dynamic routing makes the DAG *differ per layer*
+
+The decode example in §46 is the easy case — every step's sub-graph is identical and only base pointers change. **DeepSeek-style MoE is the hard case that proves the point**, and it is worth spelling out because it defeats a single flat static graph:
+
+- In a DeepSeek-MoE layer, a gating network routes each token to its **top-k of N experts**. The number of tokens that land on a given expert — that expert's effective **batch size `m_e`** (the `M` dimension of its GEMM) — is **data-dependent**: it depends on the actual token values, so it is **different for every expert, every layer, and every step**. `Σ_e m_e = k · num_tokens` is fixed, but the *distribution* across experts is not.
+- That variability is **not just a base-pointer change — it changes the graph's shape**. An expert GEMM with `M = m_e` is tiled into `⌈m_e / TILE_M⌉` InCore tile tasks (§7). So expert `e` in layer `ℓ` expands into a **different number of InCore nodes and edges** than the same expert in layer `ℓ+1`, or than its neighbor expert. The expert-parallel **all-to-all dispatch/combine** counts (§39) move with `{m_e}` too. The realized task DAG is therefore **genuinely different per layer** — different node count, different fan-in/out, different ring footprint.
+
+This is simultaneously **data-dependent control flow** (which experts are active) and **data-dependent shapes** (`m_e`), i.e. precisely the worst quadrant for AOT (§8.7.3): a single fixed schedule cannot cover it, and fully tracing all `{m_e}` combinations is combinatorially hopeless. It is the definitive argument that **"compile the whole orchestration once into one static DAG" is wrong** — the chooser (routing) *must* stay dynamic.
+
+But — and this is the key — what the routing produces is still, *each layer*, a **concrete finite DAG**; the dynamism is confined to a **small set of integer shape parameters `{m_e}`**. That is exactly what capture/replay plus a *parametric* schedule is built for (resolved below and in §51/§60):
+
+- The expert sub-graph is **templated over `m_e`** (one body, iteration space `t ∈ [0, ⌈m_e/TILE_M⌉)`, affine binding, §60-1); a layer instantiates `N` such templates with its realized `{m_e}`. Resident size stays `O(#task types)`, not `O(Σ_e instances)`.
+- `m_e` is **bucketed** (round token counts up to a small set of capacities — the standard MoE *expert-capacity* trick already does this) so the number of distinct realized topologies is small and **cacheable**, with a **padding-vs-recompile** trade just like shape buckets in §8.7.3 / §53.
+- A **cheap per-layer guard** keys the replay cache on `bucket({m_e})`; a new distribution that misses the cache triggers an **epoch fence** (§51) → instantiate the template at the new `{m_e}` (or graph-break to eager) — never a recompile of the whole model.
+
+So MoE does not weaken the design; it is the canonical workload that **forces** the capture/replay + templated-schedule split and rules out monolithic AOT.
+
+But we do not need it. The key realization:
+
+> **Each *execution* of the orchestrator produces a concrete, finite DAG.** The control flow's only job is to *decide which DAG*. Once decided, that DAG is a static object. We can **capture** the realized DAG once and **replay** it on subsequent steps that decide the same DAG — keeping the dynamic chooser, freezing the chosen graph.
+
+This is exactly the CUDA Graphs model (record a stream once, replay the captured graph), and it is the **right compromise** the question proposes: **dynamic construction to *select* the graph + AOT static graph save/playback to *execute* it.** Critically, it maps onto the **job A / job B split** already established in §8.1:
+
+- **Job A — graph construction** (tag walk, tensormap, ring planning, wiring): the expensive per-step builder. **Capture eliminates its per-step cost.**
+- **Job B — graph execution** (dispatch, fan-in/fan-out completion, reclamation): the executor. **Replay reuses it byte-for-byte, unchanged.**
+
+## 48. The Building Blocks Already Exist in `simpler`
+
+This is not a green-field feature; three shipped mechanisms are exactly the pieces of a capture/replay system, currently used in isolation:
+
+| Need | Existing `simpler` mechanism | What it proves |
+|------|------------------------------|----------------|
+| **Capture** the realized graph | **`dep_gen`** — snapshots the *inputs* of every `submit_task` into a host-resident record stream and **replays them through the same `compute_task_fanin` / `register_task_outputs` primitives** the device orchestrator uses, reconstructing the exact dependency graph offline (`deps.json`). | Capturing submits and replaying them through the canonical dep primitives reproduces the **exact** graph — with a built-in **dual-pass self-check** (oracle vs annotated) that fails if the replay graph ever diverges from the runtime graph. |
+| **Static graph representation** to replay | **`host_build_graph`** runtime variant — graph built **on the host CPU** as a **fixed `Task[]` array with explicit edges**, vs `tensormap_and_ringbuffer`'s dynamic AICPU+TensorMap construction. | A frozen `Task[]` + explicit-edge form is already a first-class, executable runtime representation — precisely the replay target. |
+| **Amortize cold-start** (prepare once, run many) | **`prepared_callable`** ABI — prepare a callable into a private slot **once** (one `dlopen`), then **run it N times** replaying the cached handle/fn pointer (`prepare + run×5 → host_dlopen == 1`). | Prepare-once/run-many with a stable cached artifact is already the supported lifecycle. |
+
+**The feature = compose them:** promote `dep_gen`'s capture from a *profiling artifact* into an *executable static schedule*, lower it to a `host_build_graph`-style `Task[]` + explicit edges, **prepare** it once into a slot (`prepared_callable`), and **replay** it — bypassing job A while job B's executor runs unchanged. `dep_gen`'s dual-pass self-check becomes the **correctness gate** that the captured schedule equals what the eager builder would have produced.
+
+## 49. What Exactly Is Captured — the Static Schedule Artifact
+
+A **capturable region** lowers to a frozen, relocatable record:
+
+1. **Task list** in submission order: `(callable digest, CallConfig, arg-slot descriptors)` — the same triple `simpler` already carries (Callable / TaskArgs / CallConfig), minus the per-tensor tags (tags are a *builder* input; once edges are frozen they are not needed — matching `simpler`'s "tags stripped at submit" rule).
+2. **Explicit dependency edges** (`pred → succ`, with arg slot + source), exactly the `deps.json` edge set — *resolved*, so replay does **zero** TensorMap lookups/inserts.
+3. **Static memory plan**: each intermediate's **relative offset** within a region arena, plus the region's total arena size — computed once from the captured lifetimes (this is the orchestration-layer counterpart of Part 2's SAVED/transient planning; for inference there is no SAVED class, so it is pure transient ring planning).
+4. **Fan-in counts and fan-out lists** precomputed per node (no Phase-0 wiring at replay).
+5. **External binding table**: which arg slots are **live-ins** (read external buffers), **live-outs** (write external buffers), and **parameters** (persistent, §26) — i.e. the addresses that get **re-pointed** on each replay. Everything else is region-internal and addressed by `arena_base + relative_offset`.
+6. **Topology key**: a hash of `(region id, control-flow path id, live-in shapes/dtypes, parameter-set identity)` used as the replay-cache key and validity guard (§53).
+
+This is precisely the `tensormap_and_ringbuffer` → `host_build_graph` transformation (dynamic, auto-derived, AICPU) ⟶ (static, explicit-edge, host-built), specialized to one realized topology.
+
+## 50. Replay Execution — Skip the Builder, Keep the Executor
+
+On a replay of a captured region the runtime does **not**: walk tags, hash into the TensorMap, allocate producer sets, push through the `wiring_queue`, or run Phase-0 wiring. Instead it:
+
+1. **Rebases** the arena to the current base; **re-points** the live-in / live-out / parameter slots from the external binding table (a handful of pointer writes, O(#region-IO)).
+2. **Resets** the precomputed `fanin_count` counters and seeds all source nodes (fanin == 0) directly into the **ready queue**.
+3. Runs the **existing** Scheduler dispatch (Phase 1) + WorkerThread mailbox dispatch + Phase-2 fan-in/fan-out completion + ring reclamation — **unchanged**.
+
+So replay cost per step ≈ (#region-IO pointer rebinds) + (job-B execution), with **job A's O(#tasks) construction removed**. This is the orchestration-layer realization of §8.1's promise: the **executor (job B) is identical** in eager and replay; only the **builder (job A)** is bypassed. At L2 the analog is switching the chip slot from the PTO2 dynamic builder to a prepared `host_build_graph` `Task[]` — removing the AICPU per-task TensorMap/ring/wiring work from the device scheduler's critical path.
+
+## 51. The Static/Dynamic Boundary and the Barrier Problem
+
+A region is **capturable** iff, between two "topology epochs," its realized DAG is invariant modulo live-in/live-out base pointers. Typical cuts for inference:
+
+| Workload region | Capturable? | Handling |
+|-----------------|-------------|----------|
+| **Decode step body** (per token, fixed shapes) | **Yes — the canonical case** | capture once, replay every token |
+| **Prefill** (variable seq-len) | Yes, **per shape bucket** | one captured variant per length bucket; cache keyed on bucket |
+| **MoE routing / expert dispatch** (data-dependent counts) | Partially | capture the static skeleton; keep the routed counts as a dynamic seam (bucketed all-to-all sizes) or graph-break |
+| **Speculative decoding / early-exit / dynamic KV growth** | No (data-dependent control flow) | stay **eager**, or capture per-branch variants keyed on the realized path id |
+
+**The barrier problem.** A captured region executes as an **opaque block** spliced between an eager prologue and epilogue. The runtime must still honor cross-boundary data dependencies (RAW/WAW/WAR) between the dynamic surroundings and the frozen block, and reclaim the block's arena cleanly. Solution — **boundary-only re-derivation**:
+
+- The region exposes a **typed I/O signature** (live-in tensors, live-out tensors). At the boundary the runtime performs **exactly the same dependency wiring the eager path would** — a TensorMap `lookup` on each live-in and an `insert` on each live-out — but **only at the region's I/O surface**: O(#region-IO) instead of O(#tasks-inside). Internal edges are frozen; only the *seam* edges are dynamic. This bounds residual job-A work to the boundary.
+- **Region arena as a scope unit.** The captured plan uses **relative** offsets inside a region arena; on replay the arena binds to a `simpler` scope/ring layer (Part 2 §14, orchestrator §6 scope→ring mapping). Because the region's internal lifetimes are self-contained, the whole arena **reclaims as a unit at region exit** — no interior FIFO interleaving with the eager surroundings, which is exactly why a captured block does not break the ring's monotone reclamation.
+- **Epoch fence.** When the topology key changes (e.g., a new seq-len bucket, a different routed path), the runtime inserts a **replay barrier**: drain in-flight work for the old variant, then bind the new variant (cache hit) or fall back to eager capture (cache miss). The fence is the orchestration analog of a `torch.compile` recompilation point.
+
+## 52. Cold Start — Paying the Capture Cost Once
+
+There is **no separate warm-up run**. Capture happens *during the first real execution* (record-on-first-run, like CUDA-graph capture on a live stream, and exactly how `dep_gen` records during a normal run):
+
+1. **First step** runs the region **eagerly** and simultaneously **records** the realized submit stream (the `dep_gen` capture path).
+2. **Lower + validate**: build the static `Task[]` + explicit edges from the record; run `dep_gen`'s **dual-pass self-check** to *prove* the frozen graph equals the eager graph (replay graph ≡ runtime graph, or the artifact is rejected).
+3. **Prepare once** (`prepared_callable`): install the lowered schedule into a private slot (`dlopen`/outline/bind), incrementing the prepare counter exactly once.
+4. **Subsequent steps** matching the topology key hit **replay**.
+
+**Amortization.** Let `C` = capture+lower+prepare cost (paid once per variant) and `S` = per-step job-A saving. Break-even after `C/S` steps. Decode runs thousands of identical steps → trivially profitable. A one-shot, never-repeating dynamic region → **never capture** (stay eager). A bounded set of buckets → capture each, cache with LRU eviction and a variant cap.
+
+## 53. Correctness Guards (When a Replay Is Valid)
+
+Before replaying, a **cheap guard** (O(#region-IO), negligible vs the work saved) checks the realized context still matches the captured topology key:
+
+- **Shape/dtype guard** on live-ins (the bucket assumption holds).
+- **Control-flow path guard**: the chooser's branch id equals the captured one.
+- **Parameter-set identity guard**: the same persistent parameters are bound (§26).
+- **Aliasing/version guard**: no captured internal buffer aliases an external buffer differently than at capture — using exactly the **overlap/version** annotations `dep_gen` already records on each edge.
+
+Guard pass → replay. Guard fail → **graph break**: run eagerly, capture a **new variant** under a new key, add to the cache. These are the orchestration-layer equivalents of `torch.compile` guards, but far cheaper because the unit is a whole region, not an op.
+
+## 54. Where This Runs in the Hierarchy (L2 AICPU vs L3+ Host)
+
+The mechanism is symmetric across the recursive Orchestrator/Scheduler/Worker composition:
+
+- **L2 (AICPU).** Today the PTO2 `tensormap_and_ringbuffer` runtime builds the graph on-device per task. Replay = prepare a **`host_build_graph`-style frozen `Task[]`** (lowered on the host from the captured trace) into the chip slot and execute it, removing the AICPU's per-task TensorMap/ring/wiring from the device scheduler critical path. The host builds the static graph **once**; the AICPU just executes descriptors.
+- **L3+ (host).** Capture the per-region submit sequence + resolved edges; replay re-pushes **pre-wired** slots straight into the per-type **ready queue**, skipping the `wiring_queue` and TensorMap entirely. Cross-process mailbox dispatch (job B) is unchanged.
+
+Both levels reuse the **same executor**; only the per-level **builder** is bypassed. Because `Worker` code does not branch on level, a captured region at any level is just a prepared callable its parent dispatches like any other.
+
+## 55. Interaction With Training (Forward + Backward)
+
+Although the question was posed for forward-only inference, the mechanism generalizes directly, because **a training step is itself one orchestration program** (§22):
+
+- The **forward region**, the **backward region** (the tape-walk submits, §24), and the **optimizer step** (§27) are each capturable regions — their topology is fixed across steps once shapes are fixed.
+- **The autograd tape becomes a compile-time product.** After the first step, the reverse-walk submit sequence (§8.3) is frozen into the backward replay artifact. This is exactly the **convergence of the eager and AOT paths** anticipated in §8.7.4 — but realized at the *orchestration* layer (freeze the submit stream) rather than the tile-algebra layer (joint fwd+bwd trace).
+- **The two AOT layers compose.** §8.7's per-differentiable-function compile (joint fwd+bwd tile fusion + min-cut rematerialization + static SAVED planning) removes intra-function overhead; **this Part's per-step orchestration replay** removes inter-task construction overhead. Together they eliminate *both* layers — the kernel-internal and the scheduling-internal — while the eager outer loop preserves dynamic control flow and shapes.
+
+## 56. Plan: Problems → Solutions → Existing Building Block
+
+| # | Problem | Solution | Reuses |
+|---|---------|----------|--------|
+| 1 | Per-step O(#tasks) tag-walk + TensorMap hashing | Freeze edges at capture; replay with explicit edges, zero lookups | `dep_gen` capture, `host_build_graph` edges |
+| 2 | Per-step `ring.alloc` mutex/cv/deque churn | Static memory plan: relative offsets + one region arena bound per replay | Part 2 arena, orchestrator scope→ring |
+| 3 | Per-step Scheduler wiring + cross-thread hand-off | Precomputed fanin/fanout; seed sources straight into ready queue | Scheduler Phase-1/2 (unchanged) |
+| 4 | Free control flow can't be fully static-compiled | Capture *realized* DAG per topology; keep dynamic chooser | CUDA-graph model |
+| 5 | Static/dynamic seam dependencies (barrier) | Boundary-only re-derivation (O(#region-IO)) + region-arena scope reclaim | TensorMap at region I/O, scope/ring |
+| 6 | Cold-start capture cost | Record-on-first-real-run; lower + dual-pass validate; prepare once | `dep_gen`, `prepared_callable` |
+| 7 | Replay validity under changing shapes/paths | Cheap topology-key guards; graph-break + new variant on miss | `dep_gen` overlap/version annotations |
+| 8 | Variant explosion | Shape bucketing + LRU cache + variant cap | (new, small) |
+
+**Phasing.**
+
+- **P0 (today).** Fully eager, define-by-run — correct, fully dynamic baseline.
+- **P1.** Single-region capture+replay at **L2 decode body**: capture via `dep_gen`, lower to `host_build_graph` `Task[]`, prepare once via `prepared_callable`, replay. Validate with the dual-pass gate. Measure with the L2 swimlane / `sched_overhead_analysis.py`.
+- **P2.** **L3+ host** replay (skip `wiring_queue` + TensorMap; seed ready queue).
+- **P3.** Guards + multi-variant cache + the **boundary barrier** for prologue/epilogue splicing; prefill shape buckets.
+- **P4.** **Training regions**: capture forward / backward / optimizer; **freeze the tape** into a backward replay artifact.
+- **P5.** **Automatic region discovery** (detect invariant topology windows) + derive the static memory plan from the captured trace; optional fusion with §8.7 per-function compile.
+
+## 57. Offloading the Orchestrator to the Host — and the No-Coherency Trap
+
+There is a strong systems incentive to move the orchestrator **off the AICPU and onto the host**: the AICPU is a scarce on-device resource (few cores, shared with the OS scheduler cluster, see the AICPU launch constraints), while host CPUs are comparatively plentiful. The per-step builder work of §46 (TensorMap hashing, ring bookkeeping, wiring) is exactly the kind of bookkeeping a host CPU should absorb so the AICPU is left to do only dispatch.
+
+But the host↔device boundary has a brutal property that makes the **naïve** offload a performance disaster:
+
+- **Host-written GM is not coherent with the AICPU data cache.** When the host publishes via `rtMemcpy` (a PCIe DMA), the AICPU's cache is **not snooped**: a line cached from a previous round survives the DMA, so the next AICPU load returns **stale** data unless the AICPU explicitly runs `cache_invalidate_range` (`dc civac` + `dsb sy` + `isb`). The `dsb sy` **dominates the cost (tens-to-hundreds of cycles, fixed regardless of range)**.
+- **Cross-bus atomics / spin-waits are worse.** Issue #822's forensics are the cautionary tale: an AICPU spinning on `while (flag == 0) {}` against a value published from outside its snoop domain **never observes the update** — `volatile`, `ldar` (acquire), and user-space `dc ivac` all fail (the first two are ordering-only; `dc ivac` is silently NOP'd at EL0). A cross-PCIe atomic counter or completion poll is not just slow, it is **incorrect** without privileged cache control.
+
+The consequence is decisive: **you must not keep a host-resident scheduler that coordinates each device task across the bus.** A design where the AICPU decrements a host-side fan-in counter, or polls a host-published "ready" flag per task, pays one `dsb sy`-dominated invalidate (or worse, a coherency bug) **per task per edge** — destroying any benefit from offloading and reintroducing correctness hazards. Per-task cross-boundary coordination is off the table.
+
+## 58. The Only Viable Coupling: Build on Host (Job A), Execute on Device (Job B), One-Shot Copy Between
+
+The job-A / job-B split (§8.1, §47) is exactly the seam that survives the no-coherency constraint:
+
+- **Job A (graph construction) → host.** The host runs the full builder (control flow, TensorMap, dependency resolution, memory planning) using its plentiful CPU and ordinary coherent host RAM. This is precisely the `host_build_graph` runtime variant: the graph is built on the host CPU as a fixed `Task[]` + explicit edges, rather than dynamically on the AICPU.
+- **Job B (execution) → device, self-contained.** The per-task fan-in counters, ready queue, dispatch, and completion all live in **device GM within the AICPU↔AICore coherency domain**, where atomics and barriers are cheap and correct. The AICPU executes descriptors; it never reaches across the bus per task.
+- **The bridge is a single one-shot transfer.** The host DMA's the **entire** built graph to device GM **once**, and the AICPU runs **one** `cache_invalidate_range` over it before reading — exactly the shipped pattern `cache_invalidate_range(runtime, sizeof(Runtime))` in `host_build_graph/aicpu/aicpu_executor.cpp`. After that single invalidate, all subsequent reads of the graph are AICPU-cacheable and coherent for the duration of the run.
+
+This converts the cost model from **O(#tasks × #edges) cross-bus invalidates** (naïve host scheduler) to **O(1) cross-bus invalidate** (one-shot graph copy) — the same transformation §51's "boundary-only" idea makes, taken to its limit: the only boundary crossing is the graph hand-off itself. It is also the perfect match for Part 5's capture/replay: **capture on host → lower to a compact static graph → one DMA → device executes autonomously → re-bind live-in/out pointers and re-DMA (or patch) on the next step.**
+
+## 59. Will the Host-Built Graph Be Too Big? — Footprint Analysis
+
+The user's concern is real and must be sized honestly. Two regimes:
+
+**Graph metadata vs tensor data.** A task descriptor is small: a 32-byte callable digest + a few `ContinuousTensor` args (40 B each) + a few edge indices ≈ a few hundred bytes; the capture-format `DepGenRecord` is 2624 B with ≤64 inline deps. For a graph of `T` tasks the metadata is `≈ T × O(hundreds of B)`. Against this, **activations and weights are GB-scale**; the graph structure is normally **MB-scale and lives in HBM** (abundant), not in SRAM. In the common case (a decode step, a single transformer layer, modest `T`) the one-shot copy is a few MB — a non-issue.
+
+**The blow-up case: fully-unrolled, tiled, deep graphs.** The danger is that the PyPTO graph is at **InCore granularity**, and InCores **tile** computation into SRAM-sized pieces. A single matmul can expand into hundreds–thousands of InCore tasks; a deep model (`L` layers) and/or long sequence multiplies that. A **fully unrolled** `host_build_graph`-style `Task[]` is `O(#task instances)`, which for a large model/long context can reach **millions of tasks → hundreds of MB to GB of descriptors** — now competing with activation/weight memory, and a multi-hundred-MB DMA per step is itself a latency problem. So: **yes, a naïvely fully-unrolled host-built graph can be too big.** That is the right thing to engineer around, not to dismiss.
+
+## 60. Keeping It Small: a Templated (Non-Unrolled) Static Schedule + Streamed Copy
+
+The fix is to **not materialize instances** the model never needed materialized. The model is intensely **repetitive and affine**, so the static schedule should be **parametric**, not flat:
+
+1. **Template + iteration space (the primary lever).** Store **one** subgraph per distinct task *type* (one transformer block; within it, one tiled-loop body), plus an **iteration space** (layer index `l ∈ [0,L)`, tile index `t ∈ [0,T)`) and an **affine binding rule** that derives each instance's tensor addresses from the indices (`base + l·layer_stride + t·tile_stride`). Resident size becomes **O(#task types)**, not **O(#task instances)** — independent of `L` and sequence length. The device "expands" the loop with deterministic **index arithmetic** (cheap, branch-free, fully coherent on-device) instead of reading millions of descriptors. This is the natural lowering of Part 5's capturable **region** (§51): a region *is* the template; its replay count is the iteration space. It is also why capture/replay and host-offload are the **same** design — the captured region is exactly the unit you copy once and instantiate many.
+2. **Streamed / double-buffered copy (the fallback when expansion must be host-side).** If a graph genuinely cannot be templated (irregular topology) and is large, copy it in **per-layer chunks** with double buffering: the device executes chunk `k` (layer `k`) while the host DMA's chunk `k+1`. This bounds resident graph memory to a **two-chunk window** and **overlaps** the transfer with compute. Crucially the synchronization is at **chunk (layer) granularity** — `O(#layers)` cross-bus invalidates, not `O(#tasks)` — keeping the coherency cost negligible while capping memory. (The chunk boundary is the §51 epoch fence, reused.)
+3. **Compact replay encoding.** The replay graph is not the capture format: use **CSR-style edge arrays** (index lists, not pointer lists), **dedup** repeated callable digests / `CallConfig` into a small table referenced by id, and store **relative** offsets (rebased per run, §50). This shrinks per-task bytes several-fold versus the 2624 B `DepGenRecord`.
+4. **HBM, not SRAM; only the working set is hot.** The full templated graph lives in device GM (HBM). The AICPU pulls only the **active window** of descriptors into its working set, so the metric that matters is the *hot* descriptor footprint (small per template), not the total — and HBM capacity (tens of GB) dwarfs MB-scale templated metadata.
+
+**Synthesis / recommendation.** Offloading the orchestrator to the host is the right answer to AICPU scarcity, **provided** it is done as **host-builds-once / device-executes-autonomously with a single one-shot copy** (`host_build_graph` + the one-time `cache_invalidate_range`), never as a host scheduler coordinating device tasks across the bus (which the no-coherency rules make slow *and* unsafe, #822). The memory cost of the one-shot graph is bounded to **MB-scale** by keeping the schedule **templated/parametric** (resident size `O(#task types)`, expanded on-device by affine index arithmetic), with **streamed per-layer double-buffered copy** as the fallback for genuinely large irregular graphs. This is the same capture/replay artifact as Part 5 — so the host-offload and the per-step-overhead-elimination goals are achieved by **one** mechanism, not two.
+
+| Design | Per-task cross-bus cost | Correctness under no-coherency | Graph memory | Verdict |
+|--------|------------------------|-------------------------------|--------------|---------|
+| Orchestrator on AICPU (today, `tensormap_and_ringbuffer`) | none (all on-device, coherent) | safe | none (built on the fly) | works, but burns scarce AICPU on per-step building (§46) |
+| Host scheduler, per-task coordination over PCIe | `O(#tasks×#edges)` `dsb sy` invalidates / atomics | **unsafe** (#822: stale flags, dead spin) | low | **rejected** |
+| Host builds once + one-shot copy + device autonomous (`host_build_graph`), **flat** `Task[]` | `O(1)` invalidate | safe | **can be GB** for unrolled tiled deep graphs (§59) | viable but memory-risky at scale |
+| **Host builds once + one-shot copy + device autonomous, *templated* + streamed (recommended)** | `O(1)` (or `O(#layers)` if streamed) invalidate | safe | **MB-scale**, `O(#task types)` | **recommended** — offloads AICPU, bus-safe, memory-bounded |
+
+## 61. Summary of Part 5 Decisions
+
+1. **Removing Python ≠ removing dynamic construction.** The codegen'd C++/AICPU orchestrator is still a define-by-run interpreter that re-derives the same DAG every step (TensorMap hashing, ring alloc, scheduler wiring, cross-thread hand-off). For inference decode this is pure redundancy.
+2. **Don't fully AOT-compile free control flow** (undecidable / requires tracing all branches). Instead **capture the realized DAG once and replay it** — the orchestration-layer CUDA-Graph, and the natural extension of the §8.1 *job A (build) vs job B (execute)* split: replay kills job A's per-step cost, job B is reused verbatim.
+3. **The pieces already ship in `simpler`:** `dep_gen` (capture + dual-pass self-check), `host_build_graph` (static `Task[]` + explicit edges = replay target), `prepared_callable` (prepare-once/run-many = cold-start amortization). The feature composes them.
+4. **The static/dynamic boundary is handled by boundary-only re-derivation** (O(#region-IO) TensorMap at the seam) and **region-arena scope reclamation** (the captured block reclaims as a unit, preserving the ring's monotone reclamation). An **epoch fence** switches variants when the topology key changes.
+5. **Cold start is paid once, on the first real run** (record-on-first-run + lower + dual-pass validate + prepare), with explicit break-even math: capture only regions that repeat (decode: yes; one-shot dynamic: never).
+6. **Cheap topology-key guards** decide replay vs graph-break, mirroring `torch.compile` guards at region granularity.
+7. **Symmetric across L2 (AICPU) and L3+ (host)** and **applies to training** (forward / backward / optimizer regions; the tape becomes a frozen artifact), composing with §8.7's per-function compile to remove both the kernel-internal and scheduling-internal overhead.
+8. **Offloading the orchestrator to the host is the right answer to AICPU scarcity — but only as build-once / execute-autonomously.** Host-written GM is **not coherent** with the AICPU cache (one `dsb sy`-dominated `cache_invalidate_range` per host-published read), and cross-bus spin/atomics are not just slow but **unsafe** (#822). A host scheduler coordinating device tasks per edge is therefore **rejected**.
+9. **The viable coupling is the job-A/job-B seam taken to the bus:** build the graph on the host (job A, `host_build_graph`), execute it on the device inside the coherent AICPU↔AICore domain (job B), bridged by a **single one-shot DMA + one `cache_invalidate_range`** — turning `O(#tasks×#edges)` cross-bus invalidates into `O(1)`.
+10. **The one-shot graph's memory is bounded by keeping the schedule templated, not unrolled.** A flat `Task[]` for a tiled, deep, long-context model can reach GB-scale (InCore tiling × layers); a **parametric template + iteration space + affine binding** makes resident size `O(#task types)` (MB-scale, expanded on-device by index arithmetic), with **streamed per-layer double-buffered copy** as the fallback. This is the *same* artifact as the capture/replay region — host-offload and per-step-overhead elimination are one mechanism.
