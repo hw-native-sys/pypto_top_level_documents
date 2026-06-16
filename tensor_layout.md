@@ -221,13 +221,81 @@ The simpler distributed runtime is responsible for tensor lifetime tracking, dep
 
 At the time of this writing there is no other runtime use of `tile_shape`. Should a future pass need it (e.g., layout-aware scheduling, peer-to-peer transfer chunking), the field is already plumbed through.
 
+## 5. pypto Grammar Enhancement: Implicit Dimension Padding for `pl.slice` and `pl.index`
+
+This section introduces two grammar conveniences for accessing an n-D tensor or sub-tensor. Both let the programmer supply fewer coordinates than the rank of the tensor; the compiler then pads the missing dimensions according to a fixed, predictable rule. This removes a large amount of boilerplate `0` / full-extent arguments from kernels that index or slice high-rank tensors.
+
+Throughout this section, dimensions are numbered from the outermost (dimension 0, varies slowest in row-major) to the innermost (dimension N-1, varies fastest). "Higher" dimension means closer to dimension 0 (outer); "lower" dimension means closer to dimension N-1 (inner).
+
+**Signature note.** The canonical pypto signature is `pl.slice(tensor, shape, offset)` — the slice shape comes first, the offset second — consistent with all existing usages in the codebase. The expansions below are written using this ordering.
+
+### 5.1 `pl.slice` — implicit lower-dimension expansion
+
+When `pl.slice` is given an offset list whose length `k` is less than the tensor rank `N`, the abbreviated form expands as follows:
+
+- **Offset.** The `k` provided values are taken as the offsets of the `k` highest (outermost) dimensions. The remaining `N − k` lower (inner) dimensions are padded with offset `0`.
+- **Shape.** The `k` highest dimensions get extent `1`. The remaining `N − k` lower dimensions adopt the full extent of the corresponding dimension of the source tensor `A`.
+
+Concretely, let `A` be a 4-D tensor with shape `(s0, s1, s2, s3)`. Then:
+
+```python
+B = pl.slice(A, [i, j])
+```
+
+is exactly equivalent to the fully-specified form:
+
+```python
+B = pl.slice(A, [1, 1, s2, s3], [i, j, 0, 0])
+#                ^^^^^^^^^^^^^^  ^^^^^^^^^^^^
+#                shape           offset
+```
+
+That is:
+
+- the two higher dimensions are pinned to offsets `i` and `j` with extent `1` each (padding the lower-dimension offsets to `0`), and
+- the two lower dimensions take the full source extents `s2` and `s3` (padding the higher-dimension shape entries with `1`).
+
+Intuitively, `pl.slice(A, [i, j])` selects the full `(s2, s3)` sub-tensor located at the `(i, j)` position of the two outer dimensions — exactly what is wanted when the outer dimensions index a batch / block grid and the inner dimensions form the tile of interest.
+
+### 5.2 `pl.index` — implicit higher-dimension padding
+
+When `pl.index` is given an index list whose length `k` is less than the tensor rank `N`, the `k` provided values are taken as the indices of the `k` lowest (innermost) dimensions, and the remaining `N − k` higher (outermost) dimensions are padded with index `0`.
+
+For the same 4-D tensor `A`:
+
+```python
+alpha = pl.index(A, [i, j])
+```
+
+is exactly equivalent to:
+
+```python
+alpha = pl.index(A, [0, 0, i, j])
+```
+
+i.e. the missing higher-dimension indices are filled with `0`, and the supplied `[i, j]` address the two innermost dimensions.
+
+### 5.3 Summary of the padding rules
+
+| Operation | Provided `k < N` values address … | Missing dimensions padded with … |
+|-----------|-----------------------------------|----------------------------------|
+| `pl.slice` offset | the `k` highest dimensions | lower-dim offsets → `0`; their shape → full source extent |
+| `pl.slice` shape | extent `1` for those `k` dims | higher-dim shape entries → `1` |
+| `pl.index` | the `k` lowest dimensions | higher-dim indices → `0` |
+
+Note the deliberate asymmetry: `pl.slice` binds the abbreviated coordinates to the outer dimensions (taking a full inner sub-tensor), whereas `pl.index` binds them to the inner dimensions (addressing the innermost elements). Both choices match the most common access patterns for their respective operations.
+
+These are purely front-end grammar conveniences. After expansion the operations have identical semantics to their fully-specified forms; the type system, IR, and back-end code generation are unchanged.
+
 ## Summary
 
-| Component        | Action required                                                                                        |
-|------------------|--------------------------------------------------------------------------------------------------------|
-| Programmer       | Optionally declare `tile_shape` on a GM tensor when the dominant `TLOAD`/`TSTORE` access pattern is known. |
-| pypto compiler   | Carry `tile_shape` in the tensor IR; validate divisibility; warn on layout-breaking ops; forward to PTOAS. |
-| PTOAS            | Use `tile_shape` to compute GM addresses; emit single-burst instructions when access matches the tile.   |
-| Simpler runtime  | Propagate `tile_shape` through descriptors and argument lists; ignore it for overlap/tensormap reasoning; surface it in debug output. |
+| Component        | Action required |
+|------------------|-----------------|
+| Programmer       | Optionally declare `tile_shape` on a GM tensor when the dominant `TLOAD`/`TSTORE` access pattern is known. Use abbreviated `pl.slice(A, […])` to pin outer dimensions and take full inner extents, and abbreviated `pl.index(A, […])` to address inner dimensions with outer indices defaulting to `0`. |
+| pypto compiler   | Carry `tile_shape` in the tensor IR; validate divisibility; warn on layout-breaking ops; forward to PTOAS. Expand abbreviated `pl.slice` / `pl.index` to their fully-specified forms per §5 before lowering; after expansion, semantics, IR, and back-end codegen are unchanged. |
+| PTOAS            | Use `tile_shape` to compute GM addresses; emit single-burst instructions when access matches the tile. No direct handling of §5 grammar sugar — it is resolved upstream. |
+| Simpler runtime  | Propagate `tile_shape` through descriptors and argument lists; ignore it for overlap/tensormap reasoning; surface it in debug output. No change for §5 grammar sugar. |
 
 When used correctly, `tile_shape` turns small-tile `TLOAD` / `TSTORE` traffic from many short, strided bursts into one long contiguous burst, restoring full GM bandwidth, NoC throughput, and L2 cache utilization — directly shortening kernel runtime on A2, A3, and A5.
+
+Abbreviated `pl.slice` and `pl.index` remove boilerplate `0` and full-extent arguments from high-rank indexing and slicing; the compiler expands them deterministically, so correctness and performance behavior match the fully-specified forms.
